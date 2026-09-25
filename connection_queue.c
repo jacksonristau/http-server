@@ -80,9 +80,14 @@ int connection_dequeue(connection_queue_t *queue) {
 }
 
 int connection_queue_shutdown(connection_queue_t *queue) {
+    if (pthread_mutex_lock(&queue->lock) != 0) {
+        fprintf(stderr, "pthread_mutex_lock() failed\n");
+        return -1;
+    }
+    queue->shutdown = 1;
     pthread_cond_broadcast(&queue->queue_full);
     pthread_cond_broadcast(&queue->queue_empty);
-    queue->shutdown = 1;
+    pthread_mutex_unlock(&queue->lock);
     return 0;
 }
 

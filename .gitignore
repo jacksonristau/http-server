@@ -1,3 +1,7 @@
 *.o
 .DS_Store
 http_server
+http_server_asan
+http_server_tsan
+*.so
+*.dSYM

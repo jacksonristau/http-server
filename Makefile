@@ -1,22 +1,34 @@
-CFLAGS = -Wall -Werror -g
-CC = gcc $(CFLAGS)
+CC = gcc
+CFLAGS = -Wall -Wextra -Werror -g
+SANFLAGS = -O1 -fno-omit-frame-pointer
+SRCS = http_server.c http.c connection_queue.c
 port = 8000
 
-.PHONY: all test test-setup clean clean-tests zip
+.PHONY: all sanitize test test-setup clean clean-tests zip
 
-all: http_server concurrent_open.so
+all: http_server
 
 http_server: http_server.c http.o connection_queue.o
-	$(CC) -o $@ $^ -lpthread
+	$(CC) $(CFLAGS) -o $@ $^ -lpthread
 
 http.o: http.c http.h
-	$(CC) -c http.c
+	$(CC) $(CFLAGS) -c http.c
 
 connection_queue.o: connection_queue.c connection_queue.h
-	$(CC) -c connection_queue.c
+	$(CC) $(CFLAGS) -c connection_queue.c
 
+# Linux-only LD_PRELOAD shim used by the concurrency test
 concurrent_open.so: concurrent_open.c
 	$(CC) $(CFLAGS) -shared -fpic -o $@ $^ -ldl
+
+# ASan and TSan can't be combined, so build a separate binary for each
+sanitize: http_server_asan http_server_tsan
+
+http_server_asan: $(SRCS) http.h connection_queue.h
+	$(CC) $(CFLAGS) $(SANFLAGS) -fsanitize=address,undefined -o $@ $(SRCS) -lpthread
+
+http_server_tsan: $(SRCS) http.h connection_queue.h
+	$(CC) $(CFLAGS) $(SANFLAGS) -fsanitize=thread -o $@ $(SRCS) -lpthread
 
 test-setup:
 	@chmod u+x testius
@@ -26,7 +38,7 @@ test: test-setup http_server clean-tests concurrent_open.so
 	PORT=$(port) ./testius test_cases/tests.json -v
 
 clean:
-	rm -rf *.o concurrent_open.so http_server
+	rm -rf *.o *.dSYM concurrent_open.so http_server http_server_asan http_server_tsan
 
 clean-tests:
 	rm -rf test_results

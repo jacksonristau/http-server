@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <limits.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <signal.h>
@@ -17,43 +18,92 @@
 #define LISTEN_QUEUE_LEN 5
 #define N_THREADS 5
 
-int keep_going = 1;
+volatile sig_atomic_t keep_going = 1;
 const char *serve_dir;
+char serve_root[PATH_MAX];  // serve_dir resolved to an absolute path
 
 void handle_sigint(int signo) {
+    (void) signo;
     keep_going = 0;
+}
+
+// map a requested resource to a path inside serve_dir
+// returns 0 on success or an HTTP error status
+int resolve_resource_path(const char *resource, char *path, size_t path_size) {
+    char joined[PATH_MAX];
+    int n = snprintf(joined, sizeof(joined), "%s%s", serve_dir, resource);
+    if (n < 0 || (size_t) n >= sizeof(joined)) {
+        return 400;
+    }
+
+    char resolved[PATH_MAX];
+    if (realpath(joined, resolved) == NULL) {
+        if (errno == ENOENT || errno == ENOTDIR) {
+            return 404;
+        }
+        if (errno == EACCES) {
+            return 403;
+        }
+        if (errno == ENAMETOOLONG) {
+            return 400;
+        }
+        perror("realpath");
+        return 500;
+    }
+
+    // reject anything that resolves outside of serve_dir (e.g. /../../etc/passwd)
+    size_t root_len = strlen(serve_root);
+    if (strncmp(resolved, serve_root, root_len) != 0 ||
+        (resolved[root_len] != '/' && resolved[root_len] != '\0')) {
+        return 403;
+    }
+
+    // rebuild relative to serve_dir so the path matches what the caller passed in
+    n = snprintf(path, path_size, "%s%s", serve_dir, resolved + root_len);
+    if (n < 0 || (size_t) n >= path_size) {
+        return 400;
+    }
+    return 0;
+}
+
+void handle_client(int client_fd) {
+    char resource[BUFSIZE];
+    int status = read_http_request(client_fd, resource, sizeof(resource));
+    if (status == -1) {
+        // connection failed, nothing to respond to
+        return;
+    }
+    if (status != 0) {
+        write_http_error(client_fd, status);
+        return;
+    }
+
+    char local_path[PATH_MAX];
+    status = resolve_resource_path(resource, local_path, sizeof(local_path));
+    if (status != 0) {
+        write_http_error(client_fd, status);
+        return;
+    }
+
+    if (write_http_response(client_fd, local_path) == -1) {
+        fprintf(stderr, "failed to write http response for %s\n", resource);
+    }
 }
 
 // threads continuously dequeue connection file descriptors
 void *consumer_loop(void* arg){
     connection_queue_t *queue = (connection_queue_t *) arg;
-    while (queue->shutdown == 0){
-        // dequeue fd
+    while (1) {
+        // dequeue fd, fails only once the queue is shut down
         int client_fd = connection_dequeue(queue);
-        if (client_fd == -1){
-            close(client_fd);
-            return (void *) -1L;
+        if (client_fd == -1) {
+            break;
         }
-        char resource[BUFSIZE];
 
-        // extract the resource name
-        if ((read_http_request(client_fd, resource)) == -1){
-            printf("failed to read http request");
-            close(client_fd);
-            return (void *) -1L;
-        }
-        char local_path[BUFSIZE];
-        sprintf(local_path, "%s%s", serve_dir, resource);
-
-        // write response back to client
-        if ((write_http_response(client_fd, local_path)) == -1){
-            printf("failed to write http response");
-            close(client_fd);
-            return (void *) -1L;
-        }
-        if (close(client_fd)) {
+        // errors are per-connection, so keep serving afterwards
+        handle_client(client_fd);
+        if (close(client_fd) == -1) {
             perror("close");
-            return (void *) -1L;
         }
     }
     return (void *) 0L;
@@ -67,6 +117,10 @@ int main(int argc, char **argv) {
     }
     serve_dir = argv[1];
     const char *port = argv[2];
+    if (realpath(serve_dir, serve_root) == NULL) {
+        perror(serve_dir);
+        return 1;
+    }
 
     // initialize queue
     connection_queue_t queue;
@@ -86,6 +140,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+    // a client disconnecting mid-response should fail the write, not kill the server
+    struct sigaction ignore;
+    ignore.sa_handler = SIG_IGN;
+    sigemptyset(&ignore.sa_mask);
+    ignore.sa_flags = 0;
+    if (sigaction(SIGPIPE, &ignore, NULL) == -1) {
+        perror("sigaction");
+        connection_queue_free(&queue);
+        return 1;
+    }
+
     // set up addrinfo
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
@@ -94,8 +159,8 @@ int main(int argc, char **argv) {
     hints.ai_flags = AI_PASSIVE;
     struct addrinfo *server;
     int res = getaddrinfo(NULL, port, &hints, &server);
-    if (res == -1){
-        printf("getaddrinfo failed: %s\n", gai_strerror(res));
+    if (res != 0){
+        fprintf(stderr, "getaddrinfo failed: %s\n", gai_strerror(res));
         connection_queue_free(&queue);
         return -1;
     }
@@ -107,6 +172,16 @@ int main(int argc, char **argv) {
         freeaddrinfo(server);
         connection_queue_free(&queue);
         return -1;
+    }
+
+    // allow restarting immediately without "address already in use"
+    int opt = 1;
+    if (setsockopt(sock_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
+        perror("setsockopt");
+        freeaddrinfo(server);
+        close(sock_fd);
+        connection_queue_free(&queue);
+        return 1;
     }
 
     // bind to port
@@ -170,15 +245,15 @@ int main(int argc, char **argv) {
     while (keep_going != 0){
         int client_fd = accept(sock_fd, NULL, NULL);
         if (client_fd == -1) {
-            if (errno != EINTR) {
-                perror("accept");
-                close(sock_fd);
-                return 1;
-            } else {
-                break;
+            if (errno == EINTR || errno == ECONNABORTED) {
+                continue;
             }
+            perror("accept");
+            break;
         }
-        connection_enqueue(&queue, client_fd);
+        if (connection_enqueue(&queue, client_fd) == -1) {
+            close(client_fd);
+        }
     }
 
     // cleanup
